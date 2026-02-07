@@ -310,7 +310,8 @@ check_deps
 # Decode project path from encoded directory name
 decode_project_path() {
     local encoded="$1"
-    echo "$encoded" | sed 's/^-/\//' | sed 's/-/\//g'
+    # Double hyphens represent /. (dotfiles/dotfolders), must decode before single hyphens
+    echo "$encoded" | sed 's/^-/\//' | sed 's/--/\/./g' | sed 's/-/\//g'
 }
 
 # Get project name (last component of decoded path)
@@ -442,66 +443,69 @@ do_search() {
     start_message_spinner
 
     # Process results for interactive selection
-    local formatted_results=()
+    # Track unique sessions with simple arrays (no associative arrays for compatibility)
     local seen_files=()
+    local formatted_results=()
 
     while IFS= read -r result; do
         # Parse ripgrep output: file:line:content
-        local file line_num content
+        local file line_num
         file=$(echo "$result" | cut -d: -f1)
         line_num=$(echo "$result" | cut -d: -f2)
-        content=$(echo "$result" | cut -d: -f3-)
 
-        # Skip if we've already seen this file (avoid duplicates)
-        if [[ ! " ${seen_files[*]} " =~ " ${file}:${line_num} " ]]; then
-            seen_files+=("${file}:${line_num}")
+        # Skip if not a valid file
+        [ ! -f "$file" ] && continue
 
-            # Get project info
-            local project_dir
-            project_dir=$(dirname "$file")
-            project_dir=$(basename "$project_dir")
-            local project_name
-            project_name=$(get_project_name "$project_dir")
+        # Only keep first match per file (avoid duplicates)
+        local already_seen=false
+        for seen in "${seen_files[@]}"; do
+            [ "$seen" = "$file" ] && already_seen=true && break
+        done
+        [ "$already_seen" = true ] && continue
+        seen_files+=("$file")
 
-            # Get timestamp from the JSONL line if possible
-            local timestamp
-            timestamp=$(sed -n "${line_num}p" "$file" 2>/dev/null | jq -r '.timestamp // empty' 2>/dev/null)
-            if [ -n "$timestamp" ]; then
-                # Check if it's an ISO string or epoch
-                if [[ "$timestamp" =~ ^[0-9]+$ ]]; then
-                    timestamp=$(date -r "$((timestamp / 1000))" "+%m-%d %H:%M" 2>/dev/null || echo "${timestamp:0:10}")
-                else
-                    # ISO format - just extract date and time
-                    timestamp=$(echo "$timestamp" | sed 's/T/ /' | cut -c6-16)
-                fi
+        # Parse the actual message content from the matched line
+        local parsed_content
+        parsed_content=$(sed -n "${line_num}p" "$file" 2>/dev/null | jq -r '
+            if .type == "user" then
+                "👤 " + (.message.content // "")
+            elif .type == "assistant" then
+                "🤖 " + ((.message.content[]? | select(.type == "text") | .text) // "")
             else
-                timestamp=$(stat -f "%Sm" -t "%m-%d %H:%M" "$file" 2>/dev/null)
-            fi
+                ""
+            end
+        ' 2>/dev/null)
 
-            # Parse the actual message content
-            local parsed_content
-            parsed_content=$(sed -n "${line_num}p" "$file" 2>/dev/null | jq -r '
-                if .type == "user" then
-                    "👤 " + (.message.content // "")
-                elif .type == "assistant" then
-                    "🤖 " + ((.message.content[]? | select(.type == "text") | .text) // "")
-                else
-                    ""
-                end
-            ' 2>/dev/null | head -c 150 | LC_ALL=C sed 's/[[:space:]]\+/ /g')
-
-            # Skip empty content (tool use entries without text)
-            if [ -z "$parsed_content" ] || [ "$parsed_content" = "👤 " ] || [ "$parsed_content" = "🤖 " ]; then
-                continue
-            fi
-
-            [ ${#parsed_content} -ge 150 ] && parsed_content="${parsed_content}..."
-
-            # Format for gum filter: "project | timestamp | preview"
-            local display_line
-            display_line=$(printf "%-20s │ %-12s │ %s" "$project_name" "$timestamp" "$parsed_content")
-            formatted_results+=("$display_line|||$file|||$line_num")
+        # Skip empty content (tool use entries without text)
+        if [ -z "$parsed_content" ] || [ "$parsed_content" = "👤 " ] || [ "$parsed_content" = "🤖 " ]; then
+            continue
         fi
+
+        # Clean and truncate snippet
+        parsed_content=$(echo "$parsed_content" | LC_ALL=C tr -d '\n' | LC_ALL=C sed 's/[[:space:]]\+/ /g' | head -c 60)
+        [ ${#parsed_content} -ge 60 ] && parsed_content="${parsed_content}..."
+
+        # Get project name
+        local project_dir project_name
+        project_dir=$(dirname "$file")
+        project_dir=$(basename "$project_dir")
+        project_name=$(get_project_name "$project_dir")
+        project_name="${project_name:0:12}"  # Truncate to 12 chars
+
+        # Get message count
+        local msg_count
+        msg_count=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+
+        # Get last modified time
+        local last_mod
+        last_mod=$(stat -f "%Sm" -t "%m-%d %H:%M" "$file" 2>/dev/null)
+
+        # Format display line with fixed widths
+        local display_line
+        display_line=$(printf "%-12s │ %-11s │ %4s │ %s" "$project_name" "$last_mod" "$msg_count" "$parsed_content")
+
+        # Store with tab delimiter: display<TAB>file<TAB>line_num
+        formatted_results+=("${display_line}	${file}	${line_num}")
     done <<< "$results"
 
     # Stop the spinner
@@ -514,44 +518,50 @@ do_search() {
 
     # Check if we have a TTY for interactive selection
     if [ ! -t 0 ] || [ ! -t 1 ]; then
-        # Non-interactive: just print results
-        printf '%s\n' "${formatted_results[@]}" | LC_ALL=C cut -d'|' -f1 | head -20
+        # Non-interactive: just print results (cut on tab to get display part)
+        printf '%s\n' "${formatted_results[@]}" | cut -f1 | head -20
         echo ""
         gum style --foreground "$COLOR_DIM" "(Showing first 20 results. Run interactively for full selection.)"
         return 0
     fi
 
-    # Use fzf with preview for interactive selection
-    # Format: "display_line	file	line_num" (tab-separated, file:line hidden after first tab)
+    # Show header
+    gum style --foreground "$COLOR_DIM" "Project      │ Last        │ Msgs │ Snippet"
+    gum style --foreground "$COLOR_DIM" "─────────────┼─────────────┼──────┼────────────────────────────────────"
+
+    # Build fzf input (already tab-delimited in formatted_results)
     local fzf_input=""
     for result in "${formatted_results[@]}"; do
-        local display_part file_part line_part
-        display_part=$(echo "$result" | LC_ALL=C cut -d'|' -f1)
-        file_part=$(echo "$result" | LC_ALL=C cut -d'|' -f4)
-        line_part=$(echo "$result" | LC_ALL=C cut -d'|' -f7)
-        fzf_input+="${display_part}	${file_part}	${line_part}"$'\n'
+        fzf_input+="${result}"$'\n'
     done
 
     # Create preview command that shows context around the match
     local preview_cmd='
         file=$(echo {} | cut -f2)
         line=$(echo {} | cut -f3)
-        if [ -n "$file" ] && [ -n "$line" ]; then
-            start=$((line - 3)); [ "$start" -lt 1 ] && start=1
-            end=$((line + 3))
+        if [ -n "$file" ] && [ -f "$file" ] && [ -n "$line" ]; then
+            start=$((line - 5)); [ "$start" -lt 1 ] && start=1
+            end=$((line + 5))
+            echo ""
             sed -n "${start},${end}p" "$file" 2>/dev/null | while IFS= read -r jsonline; do
                 msg_type=$(echo "$jsonline" | jq -r ".type // empty" 2>/dev/null)
                 case "$msg_type" in
                     user)
-                        content=$(echo "$jsonline" | jq -r ".message.content // empty" 2>/dev/null | head -c 500)
-                        [ -n "$content" ] && printf "\n\033[96m👤 USER:\033[0m\n%s\n" "$content"
+                        content=$(echo "$jsonline" | jq -r ".message.content // empty" 2>/dev/null)
+                        if [ -n "$content" ] && [ "$content" != "null" ]; then
+                            printf "\n\033[96m👤 USER:\033[0m\n%s\n" "$(echo "$content" | head -c 800)"
+                        fi
                         ;;
                     assistant)
-                        content=$(echo "$jsonline" | jq -r "(.message.content[]? | select(.type == \"text\") | .text) // empty" 2>/dev/null | head -c 1000)
-                        [ -n "$content" ] && printf "\n\033[92m🤖 CLAUDE:\033[0m\n%s\n" "$content"
+                        content=$(echo "$jsonline" | jq -r "(.message.content[]? | select(.type == \"text\") | .text) // empty" 2>/dev/null)
+                        if [ -n "$content" ] && [ "$content" != "null" ]; then
+                            printf "\n\033[92m🤖 CLAUDE:\033[0m\n%s\n" "$(echo "$content" | head -c 1200)"
+                        fi
                         ;;
                 esac
             done
+        else
+            echo "No preview available"
         fi
     '
 
@@ -562,9 +572,10 @@ do_search() {
         --with-nth=1 \
         --preview="$preview_cmd" \
         --preview-window=right:50%:wrap \
-        --header="Select a result (preview on right)" \
-        --color="pointer:212,marker:212,hl:212,hl+:212" \
+        --header="↑↓ navigate │ Enter select │ Esc cancel" \
+        --color="pointer:212,marker:212,hl:212,hl+:212,header:240" \
         --bind="enter:accept" \
+        --no-info \
     )
 
     if [ -z "$selection" ]; then
